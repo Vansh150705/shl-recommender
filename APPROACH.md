@@ -1,117 +1,70 @@
-# SHL Assessment Recommender — Approach Document
+# Approach Document — SHL Assessment Recommender
 
-**Candidate:** AI Intern Application | **Stack:** Python · FastAPI · Gemini 2.0 Flash · Keyword Retrieval
+## What I Built and Why
 
----
+When I first read the problem, the core challenge was clear: most assessment catalogues assume the user already knows what they want. A hiring manager who says "I need something for a Java developer" doesn't know if they mean a knowledge test, a coding simulation, or a personality measure. The agent needs to figure that out through conversation.
 
-## 1. Problem Decomposition
-
-The core challenge is moving a user from a vague hiring intent to a grounded shortlist through dialogue, without hallucinating assessments. I decomposed this into four sub-problems:
-
-- **Retrieval** — given a natural-language query, which catalog items are candidates?
-- **Dialogue management** — when to clarify, when to recommend, when to refuse
-- **Grounding** — ensuring every URL and name in the output comes from the real catalog
-- **Schema compliance** — every response must match the exact JSON spec
+I built a FastAPI service that takes the full conversation history on every call, retrieves the most relevant assessments from the SHL catalog, and uses an LLM to drive the dialogue — clarifying when needed, recommending when ready, and refusing anything off-topic.
 
 ---
 
-## 2. Architecture
+## Architecture
 
-```
-POST /chat (stateless)
-      │
-      ▼
-Keyword Retrieval  ──►  Top-20 catalog items
-      │
-      ▼
-Prompt Builder  ──►  System prompt + catalog snippets + full conversation history
-      │
-      ▼
-Gemini 2.0 Flash  ──►  JSON response
-      │
-      ▼
-URL Validator  ──►  Strip hallucinated items, keep only catalog-verified URLs
-      │
-      ▼
-ChatResponse  ──►  reply + recommendations[] + end_of_conversation
-```
+The system has three moving parts:
 
-**Stateless design:** the full conversation history is sent on every call. No per-session state is stored server-side, exactly as specified.
+**1. Keyword Retrieval**
+When a request comes in, I score every catalog item against the conversation text using a combination of direct name matching (high weight), description/keyword matching, and category-based boosting. This returns 12 candidate items in under 5ms — no vector database, no embedding API call.
+
+I deliberately chose keyword retrieval over embeddings. The catalog has ~120 items, which is small enough to score exhaustively. Embedding calls would add 300–800ms of latency on every request, pushing dangerously close to the 30-second timeout when combined with the LLM call. Keeping retrieval fast and local was the right trade-off here.
+
+**2. Prompt Engineering**
+The retrieved catalog items are injected as structured snippets (name, URL, type, job levels, duration, description) directly into the prompt. The system prompt enforces four behaviors: clarify vague queries before recommending, recommend 1–10 items once context is clear, update the shortlist when constraints change mid-conversation, and refuse anything outside SHL assessments.
+
+I set temperature to 0.2 to keep the JSON output consistent and reduce the chance of the model going off-format.
+
+**3. Hallucination Guard**
+Every URL in the model's response is validated against the catalog before being returned. If a name matches a catalog item, I replace whatever URL the model gave with the real one. If neither the name nor URL matches anything in the catalog, the item is silently dropped. This gives a hard guarantee: the API never returns a URL that isn't in the real SHL catalog.
 
 ---
 
-## 3. Retrieval Setup
+## Retrieval Design
 
-I chose **keyword-based retrieval** over a vector store for three reasons:
-- The catalog (~120 items) is small enough to score exhaustively in <5ms
-- No external dependency (no Chroma, FAISS, or embedding API call) keeps cold-start fast and stays well within the 30-second timeout
-- Transparent scoring makes hallucination easier to prevent
+The scoring logic works like this:
+- +3 points if a query word appears in the item name
+- +1 point for each query word found in the description, keys, or job levels
+- +2 points category boost when a known domain (java, personality, cognitive, etc.) appears in both the query and the item
 
-**Scoring logic:**
-- +3.0 if query word appears in the item **name** (high signal)
-- +1.0 for each query word appearing in description/keys/levels
-- +2.0 category boost when a known keyword category (e.g. "java", "personality", "cognitive") appears in both query and item text
-
-This returns 15–25 candidates which are injected into the Gemini prompt as structured context.
+This means "hiring a mid-level Java developer" naturally surfaces Java knowledge tests, while "leadership potential executive" surfaces OPQ and scenario-based tests. For ambiguous queries, the fallback adds diverse items spanning different test types.
 
 ---
 
-## 4. Prompt Design
+## Dialogue Logic
 
-The system prompt enforces four hard constraints:
+The agent is designed to handle four conversation patterns:
 
-1. **Clarify before recommending** on vague queries (turn 1 with no role/level/goal)
-2. **Recommend 1–10 items** once role + measurement goal is clear
-3. **Refine, don't restart** when user changes constraints mid-conversation
-4. **Refuse off-topic** requests (general hiring advice, legal, prompt injection)
+- **Clarify:** On a vague first message, ask one focused question (role? level? what to measure?)
+- **Recommend:** Once role + context is clear, commit to a shortlist of 1–10 items with names and URLs
+- **Refine:** When the user changes constraints ("add personality tests", "actually senior level"), update the existing shortlist rather than starting over
+- **Compare:** When asked about differences between assessments, answer from the catalog data injected in the prompt — not from the model's training knowledge
 
-The catalog context is injected as structured snippets (Name, URL, Type, Levels, Duration, Description) so Gemini can answer comparison questions from data rather than prior knowledge.
-
-**Temperature = 0.2** keeps responses deterministic and schema-compliant.
+The turn cap (8 turns) is enforced server-side by slicing the messages array. By turn 4, the system prompt instructs the model to commit to a recommendation even with partial information.
 
 ---
 
-## 5. Hallucination Prevention
+## What Didn't Work
 
-Every URL in the response is validated against the catalog before being returned. If Gemini returns a name or URL not in the catalog, it is silently dropped. This gives a hard guarantee: **the API never returns a URL that isn't in the SHL catalog.**
+**Embeddings-based retrieval** — I tried using sentence embeddings for retrieval early on. Recall improved on abstract queries like "leadership potential" but latency went up significantly. With the 30-second timeout constraint, the safer choice was keyword retrieval.
 
----
+**Injecting the full catalog into the prompt** — My first version sent all 120 items as context. This burned tokens fast, hit rate limits immediately, and made the prompt unwieldy. Limiting to 12 retrieved candidates fixed both problems.
 
-## 6. Evaluation Approach
-
-I tested against the three scoring criteria:
-
-**Hard evals (schema compliance):**
-- Ran automated tests for every response shape — verified `recommendations`, `reply`, `end_of_conversation` are always present and correctly typed
-- Verified vague queries return `recommendations: []`
-- Verified turn cap (8) is enforced server-side by slicing the messages array
-
-**Recall@10:**
-- Tested 6 personas manually (Java developer, Data Scientist, Sales Manager, Entry-Level Customer Service, Senior Leader, General Cognitive)
-- Measured whether expected assessments appeared in top-10 results
-- Retrieval recall was highest for tech roles (Java, Python) and lowest for abstract roles ("leadership potential") — mitigated by including personality and cognitive tests as defaults for ambiguous roles
-
-**Behavior probes:**
-- Off-topic refusal: ✅ reliably refused general hiring advice
-- No premature recommendation: ✅ vague "I need an assessment" triggers clarification
-- Refinement honored: ✅ "add personality tests" updates shortlist in-place
-- Comparison grounded: ✅ OPQ vs GSA comparison pulls from catalog descriptions
+**Pinned package versions on Python 3.14** — The initial deploy on Render failed because Python 3.14 doesn't have pre-built wheels for pinned older packages. Fixed by adding a `runtime.txt` specifying Python 3.11 and unpinning versions in requirements.
 
 ---
 
-## 7. What Didn't Work
+## Stack
 
-- **Embedding-based retrieval (early attempt):** using `text-embedding-004` improved recall on abstract queries but added ~800ms latency per call and required an extra API round-trip, risking the 30s timeout. Dropped in favour of keyword retrieval.
-- **Single-turn prompting:** early versions asked Gemini to handle both retrieval and ranking in one prompt. This caused the model to occasionally recommend items it inferred from training data rather than the provided context. Fixed by injecting catalog snippets explicitly and adding URL validation.
-
----
-
-## 8. Stack Justification
-
-| Component | Choice | Reason |
-|-----------|--------|--------|
-| LLM | Gemini 2.0 Flash | Free tier, fast, 1M context window fits entire catalog |
-| Framework | FastAPI | Native async, auto schema validation via Pydantic |
-| Retrieval | Keyword scoring | Fast, transparent, no external deps |
-| Deployment | Render (free) | Matches the 2-min cold-start allowance in spec |
-| AI tools used | Claude (code assistance), Gemini (runtime LLM) | Used for code generation; all design decisions and trade-offs are my own |
+- **LLM:** Groq (llama-3.3-70b-versatile) — fast, free tier with generous limits, no quota issues
+- **Framework:** FastAPI — native async, auto Pydantic validation, auto-generated docs at /docs
+- **Retrieval:** In-memory keyword scoring — fast, transparent, zero external dependencies
+- **Deployment:** Render free tier — matches the 2-minute cold-start allowance in the spec
+- **AI tools used:** Claude for code assistance during development. All design decisions, trade-offs, and debugging were my own.

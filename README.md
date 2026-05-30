@@ -14,7 +14,7 @@ A conversational API that helps hiring managers find the right SHL assessments t
 
 ---
 
-## How It Works
+## How It Works ?
 
 Send the full conversation history on every call. The API is stateless — no session is stored server-side.
 
